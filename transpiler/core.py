@@ -62,10 +62,10 @@ class Transpiler(object):
         else:
             meta.asttools.python_source(self.ast, stream)
 
-    def transform(self, variables={}, stream=sys.stdout):
+    def transform(self, var={}, stream=sys.stdout):
         matches = self.match(False, self.ast)
         if len(matches) == 1:
-            result = matches[0].transform(variables, 0)
+            result = matches[0].transform(var, 0)
             if stream is None:
                 return result
             else:
@@ -112,50 +112,71 @@ class Transpiler(object):
                 name = "(dict)"
             else:
                 name = repr(node)
-            stream.write("{:50s} {:10s} {}\n".format("".join(trail), name, ", ".join(match.rule.name for match in results) if len(results) > 0 else "(nothing)"))
+            stream.write("{:50s} {:15s} {}\n".format("".join(trail), name, ", ".join(map(repr, results)) if len(results) > 0 else "(nothing)"))
 
         return results
 
 # downward recursion, looking for a complete match
-def matches(pattern, target):
+def matches(pattern, target, refs):
     if isinstance(pattern, ast.AST) and isinstance(target, ast.AST):
         if pattern.__class__ == target.__class__:
-            return all(matches(getattr(pattern, field), getattr(target, field)) for field in pattern._fields)
+            return all(matches(getattr(pattern, field), getattr(target, field), refs) for field in pattern._fields)
         else:
             return False
 
+    elif isinstance(pattern, Pattern):
+        return pattern.matches(target, refs)
+
     elif isinstance(pattern, (list, tuple)) and isinstance(target, (list, tuple)):
         if len(pattern) == len(target):
-            return all(matches(x, y) for x, y in zip(pattern, target))
+            return all(matches(x, y, refs) for x, y in zip(pattern, target))
         else:
             return False
 
     elif isinstance(pattern, dict) and isinstance(target, dict):
         if set(pattern.keys()) == set(target.keys()):
-            return all(matches(pattern[k], target[k]) for k in pattern.keys())
+            return all(matches(pattern[k], target[k], refs) for k in pattern.keys())
         else:
             return False
 
     else:
         return pattern == target
 
-class Match(object):
-    def __init__(self, rule, node):
-        self.rule = rule
-        self.node = node
-    def __repr__(self):
-        if isinstance(self.node, ast.AST):
-            name = self.node.__class__.__name__
+class Pattern(object):
+    pass
+
+class Any(Pattern):
+    def __init__(self, ref, *types):
+        self.ref = ref
+        self.types = types
+
+    def matches(self, node, refs):
+        if len(self.types) > 0:
+            out = isinstance(node, self.types)
         else:
-            name = repr(self.node)
-        return "Match({}, {})".format(rule.name, name)
+            out = True
+        if out:
+            refs[self.ref] = node
+        return out
+
+class Match(object):
+    def __init__(self, rule, refs):
+        self.rule = rule
+        self.refs = refs
+
+    def __repr__(self):
+        return self.rule.name + "(" + repr(self.refs) + ")"
 
 class Rule(object):
     def __init__(self, name, pattern):
         self.name = name
         self.pattern = pattern
+
     def __repr__(self):
-        return "Rule({}, {})".format(self.name, self.pattern)
+        return "Rule({}, {}, {})".format(self.name, self.pattern, repr(self.format))
+
     def matches(self, node):
-        if matches(self.pattern, node):
-            yield Match(self, node)
+        refs = {}
+        if matches(self.pattern, node, refs):
+            yield Match(self, refs)
+        
