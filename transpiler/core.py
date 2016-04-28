@@ -22,19 +22,50 @@ import meta.decompiler
 import meta.asttools
 import meta.asttools.visitors.pysourcegen
 
-class ReplacementText(ast.AST):
-    def __init__(self, text):
-        self.text = text
-        self._fields = ("text",)
+class Block(ast.AST):
+    def __init__(self, before, body, after, indent=True):
+        self.before = before
+        self.body = body
+        self.after = after
+        self.indent = indent
+        self._fields = ("before", "body", "after",)
 
-def visitReplacementText(self, node):
-    getattr(self, "print")(node.text)
+def visitBlock(self, node):
+    p = getattr(self, "print")
+    if node.before is not None:
+        self.visit(node.before)
+    if node.indent:
+        with self.indenter:
+            for b in node.body:
+                self.visit(b)
+    else:
+        with self.no_indent:
+            for b in node.body:
+                self.visit(b)
+    if node.after is not None:
+        self.visit(node.after)
 
-meta.asttools.visitors.pysourcegen.SourceGen.visitReplacementText = \
-    types.MethodType(visitReplacementText, None, meta.asttools.visitors.pysourcegen.SourceGen)
+class Format(ast.AST):
+    def __init__(self, formatter, *args):
+        self.formatter = formatter
+        self.args = args
+        self._fields = ("formatter",)
 
-meta.asttools.visitors.pysourcegen.ExprSourceGen.visitReplacementText = \
-    types.MethodType(visitReplacementText, None, meta.asttools.visitors.pysourcegen.ExprSourceGen)
+def visitFormat(self, node):
+    p = getattr(self, "print")
+    p(node.formatter, *node.args)
+
+meta.asttools.visitors.pysourcegen.SourceGen.visitBlock = \
+    types.MethodType(visitBlock, None, meta.asttools.visitors.pysourcegen.SourceGen)
+
+meta.asttools.visitors.pysourcegen.ExprSourceGen.visitBlock = \
+    types.MethodType(visitBlock, None, meta.asttools.visitors.pysourcegen.ExprSourceGen)
+
+meta.asttools.visitors.pysourcegen.SourceGen.visitFormat = \
+    types.MethodType(visitFormat, None, meta.asttools.visitors.pysourcegen.SourceGen)
+
+meta.asttools.visitors.pysourcegen.ExprSourceGen.visitFormat = \
+    types.MethodType(visitFormat, None, meta.asttools.visitors.pysourcegen.ExprSourceGen)
 
 class TranspilerException(Exception):
     pass
@@ -79,18 +110,18 @@ class Transpiler(object):
             meta.asttools.python_source(self.ast, stream)
 
     def transform(self, var={}, verbose=True):
-        matched = _match(var, verbose, self.ast, self.rules, [])
-        return _tostring(var, matched)
+        matched = _upwardRecursion(var, verbose, self.ast, self.rules, [])
+        return _tostring(matched)
         
-def _tostring(var, node):
-    return meta.asttools.dump_python_source(node).strip("\n")
+def _tostring(node):
+    return meta.asttools.dump_python_source(node).lstrip("\n")
 
-def _match(var, verbose, node, rules, trail):
+def _upwardRecursion(var, verbose, node, rules, trail):
     if isinstance(node, ast.AST):
         # upward recursion, looking for partial matches
         submatches = dict(node.__dict__)
         for field in node._fields:
-            submatches[field] = _match(var, verbose, getattr(node, field), rules, trail + ["." + field])
+            submatches[field] = _upwardRecursion(var, verbose, getattr(node, field), rules, trail + ["." + field])
         out = node.__class__(**submatches)
 
         matches = filter(lambda x: x is not None, [rule.match(out) for rule in rules])
@@ -117,35 +148,35 @@ def _match(var, verbose, node, rules, trail):
                         first = False
                     else:
                         sys.stdout.write(" " * len(prefix))
-                    sys.stdout.write(match.rule.name + ": " + repr(_tostring(var, out)) + " -> " + repr(match.transform(var)) + "\n")
+                    sys.stdout.write(match.rule.name + ": " + repr(_tostring(out)) + " -> " + repr(_tostring(match.transform(var))) + "\n")
 
         if len(matches) > 0:
-            out = ReplacementText(match.transform(var))
-
-        return out
+            return matches[0].transform(var)
+        else:
+            return out
 
     elif isinstance(node, (list, tuple)):
         # upward recursion, looking for partial matches
         out = []
         for i, x in enumerate(node):
-            out.append(_match(var, verbose, x, rules, trail + ["[" + str(i) + "]"]))
+            out.append(_upwardRecursion(var, verbose, x, rules, trail + ["[" + str(i) + "]"]))
         return out
 
     elif isinstance(node, dict):
         # upward recursion, looking for partial matches
         out = {}
         for k, v in node.items():
-            out[k] = _match(var, verbose, v, rules, trail + ["[" + repr(k) + "]"])
+            out[k] = _upwardRecursion(var, verbose, v, rules, trail + ["[" + repr(k) + "]"])
         return out
 
     else:
         return node
 
 # downward recursion, looking for a complete match
-def _matches(pattern, target, refs):
+def _downwardRecursion(pattern, target, refs):
     if isinstance(pattern, ast.AST) and isinstance(target, ast.AST):
         if pattern.__class__ == target.__class__:
-            return all(_matches(getattr(pattern, field), getattr(target, field), refs) for field in pattern._fields)
+            return all(_downwardRecursion(getattr(pattern, field), getattr(target, field), refs) for field in pattern._fields)
         else:
             return False
 
@@ -154,13 +185,13 @@ def _matches(pattern, target, refs):
 
     elif isinstance(pattern, (list, tuple)) and isinstance(target, (list, tuple)):
         if len(pattern) == len(target):
-            return all(_matches(x, y, refs) for x, y in zip(pattern, target))
+            return all(_downwardRecursion(x, y, refs) for x, y in zip(pattern, target))
         else:
             return False
 
     elif isinstance(pattern, dict) and isinstance(target, dict):
         if set(pattern.keys()) == set(target.keys()):
-            return all(_matches(pattern[k], target[k], refs) for k in pattern.keys())
+            return all(_downwardRecursion(pattern[k], target[k], refs) for k in pattern.keys())
         else:
             return False
 
@@ -204,24 +235,23 @@ class Match(object):
         return "Match({}, {}, {})".format(self.rule.name, name, repr(self.refs))
 
     def transform(self, var):
-        s = {k: _tostring(var, v) for k, v in self.refs.items()}
-        return self.rule.transform(dict(s, **var))
+        return self.rule.transform(dict(self.refs, **var))
 
 class Rule(object):
-    def __init__(self, name, pattern, format):
+    def __init__(self, name, pattern, to):
         self.name = name
         self.pattern = pattern
-        self.format = format
+        self.to = to
 
     def __repr__(self):
-        return "Rule({}, {}, {})".format(self.name, self.pattern, repr(self.format))
+        return "Rule({}, {}, {})".format(self.name, self.pattern, repr(self.to))
 
     def match(self, node):
         refs = {}
-        if _matches(self.pattern, node, refs):
+        if _downwardRecursion(self.pattern, node, refs):
             return Match(self, node, refs)
         else:
             return None
 
     def transform(self, var):
-        return self.format.format(**var)
+        return self.to(**var)
