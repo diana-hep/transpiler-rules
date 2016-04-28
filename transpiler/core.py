@@ -16,9 +16,25 @@
 
 import ast
 import sys
+import types
 
 import meta.decompiler
 import meta.asttools
+import meta.asttools.visitors.pysourcegen
+
+class ReplacementText(ast.AST):
+    def __init__(self, text):
+        self.text = text
+        self._fields = ("text",)
+
+def visitReplacementText(self, node):
+    getattr(self, "print")(node.text)
+
+meta.asttools.visitors.pysourcegen.SourceGen.visitReplacementText = \
+    types.MethodType(visitReplacementText, None, meta.asttools.visitors.pysourcegen.SourceGen)
+
+meta.asttools.visitors.pysourcegen.ExprSourceGen.visitReplacementText = \
+    types.MethodType(visitReplacementText, None, meta.asttools.visitors.pysourcegen.ExprSourceGen)
 
 class TranspilerException(Exception):
     pass
@@ -52,7 +68,7 @@ class Transpiler(object):
 
     def tree(self, stream=sys.stdout):
         if stream is None:
-            return meta.asttools.str_ast(self.ast, " ", "\n")
+            return meta.asttools.str_ast(self.ast, " ", "\n").strip("\n")
         else:
             meta.asttools.print_ast(self.ast, " ", 0, "\n", stream)
 
@@ -62,44 +78,22 @@ class Transpiler(object):
         else:
             meta.asttools.python_source(self.ast, stream)
 
-    def transform(self, var={}, stream=sys.stdout):
-        matches = self.match(False, self.ast)
-        if len(matches) == 1:
-            result = matches[0].transform(var, 0)
-            if stream is None:
-                return result
-            else:
-                stream.write(result)
+    def transform(self, var={}, verbose=True):
+        matched = _match(var, verbose, self.ast, self.rules, [])
+        return _tostring(var, matched)
+        
+def _tostring(var, node):
+    return meta.asttools.dump_python_source(node).strip("\n")
 
-        elif len(matches) == 0:
-            raise TranspilerException("no rules matched the function; try calling .match(verbose=True)")
-
-        else:
-            raise TranspilerException("top level is ambiguous; the following rules match: " + ", ".join(rule.name for rule in matches))
-
-    def match(self, verbose=True, stream=sys.stdout):
-        return self._match(verbose, self.ast, [], stream)
-
-    def _match(self, verbose, node, trail, stream):
-        submatches = {}
-
+def _match(var, verbose, node, rules, trail):
+    if isinstance(node, ast.AST):
         # upward recursion, looking for partial matches
-        if isinstance(node, ast.AST):
-            for field in node._fields:
-                submatches[field] = self._match(verbose, getattr(node, field), trail + ["." + field], stream)
+        submatches = dict(node.__dict__)
+        for field in node._fields:
+            submatches[field] = _match(var, verbose, getattr(node, field), rules, trail + ["." + field])
+        out = node.__class__(**submatches)
 
-        elif isinstance(node, (list, tuple)):
-            for i, x in enumerate(node):
-                submatches[i] = self._match(verbose, x, trail + ["[" + str(i) + "]"], stream)
-
-        elif isinstance(node, dict):
-            for k, v in node.items():
-                submatches[k] = self._match(verbose, v, trail + ["[" + repr(k) + "]"], stream)
-
-        results = []
-        for rule in self.rules:
-            for match in rule.matches(node):
-                results.append(match)
+        matches = filter(lambda x: x is not None, [rule.match(out) for rule in rules])
 
         if verbose:
             if isinstance(node, ast.AST):
@@ -112,15 +106,46 @@ class Transpiler(object):
                 name = "(dict)"
             else:
                 name = repr(node)
-            stream.write("{:50s} {:15s} {}\n".format("".join(trail), name, ", ".join(map(repr, results)) if len(results) > 0 else "(nothing)"))
+            prefix = "{:50s} {:15s} ".format("".join(trail), name)
+            if len(matches) == 0:
+                sys.stdout.write(prefix + "\n")
+            else:
+                first = True
+                for match in matches:
+                    if first:
+                        sys.stdout.write(prefix)
+                        first = False
+                    else:
+                        sys.stdout.write(" " * len(prefix))
+                    sys.stdout.write(match.rule.name + ": " + repr(_tostring(var, out)) + " -> " + repr(match.transform(var)) + "\n")
 
-        return results
+        if len(matches) > 0:
+            out = ReplacementText(match.transform(var))
+
+        return out
+
+    elif isinstance(node, (list, tuple)):
+        # upward recursion, looking for partial matches
+        out = []
+        for i, x in enumerate(node):
+            out.append(_match(var, verbose, x, rules, trail + ["[" + str(i) + "]"]))
+        return out
+
+    elif isinstance(node, dict):
+        # upward recursion, looking for partial matches
+        out = {}
+        for k, v in node.items():
+            out[k] = _match(var, verbose, v, rules, trail + ["[" + repr(k) + "]"])
+        return out
+
+    else:
+        return node
 
 # downward recursion, looking for a complete match
-def matches(pattern, target, refs):
+def _matches(pattern, target, refs):
     if isinstance(pattern, ast.AST) and isinstance(target, ast.AST):
         if pattern.__class__ == target.__class__:
-            return all(matches(getattr(pattern, field), getattr(target, field), refs) for field in pattern._fields)
+            return all(_matches(getattr(pattern, field), getattr(target, field), refs) for field in pattern._fields)
         else:
             return False
 
@@ -129,13 +154,13 @@ def matches(pattern, target, refs):
 
     elif isinstance(pattern, (list, tuple)) and isinstance(target, (list, tuple)):
         if len(pattern) == len(target):
-            return all(matches(x, y, refs) for x, y in zip(pattern, target))
+            return all(_matches(x, y, refs) for x, y in zip(pattern, target))
         else:
             return False
 
     elif isinstance(pattern, dict) and isinstance(target, dict):
         if set(pattern.keys()) == set(target.keys()):
-            return all(matches(pattern[k], target[k], refs) for k in pattern.keys())
+            return all(_matches(pattern[k], target[k], refs) for k in pattern.keys())
         else:
             return False
 
@@ -160,23 +185,43 @@ class Any(Pattern):
         return out
 
 class Match(object):
-    def __init__(self, rule, refs):
+    def __init__(self, rule, node, refs):
         self.rule = rule
+        self.node = node
         self.refs = refs
 
     def __repr__(self):
-        return self.rule.name + "(" + repr(self.refs) + ")"
+        if isinstance(node, ast.AST):
+            name = node.__class__.__name__
+        elif isinstance(node, list):
+            name = "(list)"
+        elif isinstance(node, tuple):
+            name = "(tuple)"
+        elif isinstance(node, dict):
+            name = "(dict)"
+        else:
+            name = repr(node)
+        return "Match({}, {}, {})".format(self.rule.name, name, repr(self.refs))
+
+    def transform(self, var):
+        s = {k: _tostring(var, v) for k, v in self.refs.items()}
+        return self.rule.transform(dict(s, **var))
 
 class Rule(object):
-    def __init__(self, name, pattern):
+    def __init__(self, name, pattern, format):
         self.name = name
         self.pattern = pattern
+        self.format = format
 
     def __repr__(self):
         return "Rule({}, {}, {})".format(self.name, self.pattern, repr(self.format))
 
-    def matches(self, node):
+    def match(self, node):
         refs = {}
-        if matches(self.pattern, node, refs):
-            yield Match(self, refs)
-        
+        if _matches(self.pattern, node, refs):
+            return Match(self, node, refs)
+        else:
+            return None
+
+    def transform(self, var):
+        return self.format.format(**var)
