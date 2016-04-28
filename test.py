@@ -33,5 +33,3 @@ print "======================================================"
 print
 print result
 print
-print "======================================================"
-Transpiler(sqr, [fcndef, param, ret, pow2, powN]).python()
